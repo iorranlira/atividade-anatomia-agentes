@@ -1,6 +1,7 @@
 import inspect
 import json
 import os
+import trace
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -36,6 +37,22 @@ If no action is needed, respond in plain prose.
 YOU_COLOR = "\u001b[94m"
 ASSISTANT_COLOR = "\u001b[93m"
 RESET_COLOR = "\u001b[0m"
+
+def extract_thought(text: str) -> str:
+    """
+    Retorna o texto produzido pelo modelo antes da primeira chamada de tool.
+    """
+    lines = text.splitlines()
+
+    thought_lines = []
+
+    for line in lines:
+        if line.strip().startswith("tool:"):
+            break
+
+        thought_lines.append(line)
+
+    return "\n".join(thought_lines).strip()
 
 def resolve_abs_path(path_str: str) -> Path:
     """
@@ -157,26 +174,46 @@ def execute_llm_call(conversation: List[Dict[str, str]]):
     response = openai_client.chat.completions.create(
         model="qwen/qwen3.8-27b",
         messages=conversation,
-        max_completion_tokens=2000
+        max_tokens=1000
     )
     return response.choices[0].message.content
 
 def run_coding_agent_loop():
+    trace.clear_trace()
+
     print(get_full_system_prompt())
     conversation = [{
         "role": "system",
         "content": get_full_system_prompt()
     }]
+
+    interaction_id = 0
+
     while True:
         try:
             user_input = input(f"{YOU_COLOR}You:{RESET_COLOR}:")
         except (KeyboardInterrupt, EOFError):
             break
+
+        interaction_id += 1
+
         conversation.append({
             "role": "user",
             "content": user_input.strip()
         })
+
+
+        trace.write_interaction(
+            interaction_id,
+            user_input.strip()
+        )
+        iteration = 0
+
+
         while True:
+
+            iteration += 1
+
             assistant_response = execute_llm_call(conversation)
             tool_invocations = extract_tool_invocations(assistant_response)
             if not tool_invocations:
@@ -185,7 +222,22 @@ def run_coding_agent_loop():
                     "role": "assistant",
                     "content": assistant_response
                 })
+
+                trace.write_iteration(
+                    iteration=iteration,
+                    thought=assistant_response
+                )
                 break
+
+
+            thought = extract_thought(assistant_response)
+
+
+            conversation.append({
+                "role": "assistant",
+                "content": assistant_response
+            })    
+
             for name, args in tool_invocations:
                 tool = TOOL_REGISTRY[name]
                 resp = ""
@@ -198,6 +250,15 @@ def run_coding_agent_loop():
                     resp = tool(args.get("path", "."),
                                 args.get("old_str", ""),
                                 args.get("new_str", ""))
+                
+                trace.write_iteration(
+                    iteration=iteration,
+                    thought=thought,
+                    action=name,
+                    args=args,
+                    observation=resp
+                )
+                   
                 conversation.append({
                     "role": "user",
                     "content": f"tool_result({json.dumps(resp)})"
